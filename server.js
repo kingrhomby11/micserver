@@ -1,186 +1,151 @@
-// server.js (patched)
+// server.js -- WebRTC signaling server (simple relay)
+// Usage: deploy to Railway or any Node host. Uses process.env.PORT.
+
 import http from "http";
 import { WebSocketServer } from "ws";
 
-const AUTHORIZED_IP = "115.129.74.51"; // your IP
+const AUTHORIZED_IP = "115.129.74.51"; // only this IP may broadcast
 const PORT = process.env.PORT || 3000;
 
 const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("WebSocket audio relay running\n");
+    res.end("WebRTC signaling server\n");
 });
 
 const wss = new WebSocketServer({ server });
 
-// Keep a small rolling list of initial chunks (init header + a few frames).
-// We'll replay these for any newly-connected listener so they can decode.
-const INIT_CHUNKS_MAX = 6;
-const initChunks = []; // Array<Buffer>
+// Track sockets
+let broadcaster = null; // ws that is broadcaster
+const watchers = new Map(); // id -> ws
 
-// Per-listener outgoing queues and state
-const listenerQueues = new Map(); // Map<WebSocket, Array<Buffer>>
-const listenerProcessing = new Map(); // Map<WebSocket, boolean>
+function send(ws, obj) {
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify(obj));
+}
 
-function broadcastJSON(obj) {
-    const s = JSON.stringify(obj);
+function broadcastStatus() {
+    const status = {
+        type: "status",
+        broadcasterConnected: !!broadcaster,
+        listenerCount: Array.from(wss.clients).filter(c => c !== broadcaster).length
+    };
     for (const c of wss.clients) {
-        if (c.readyState === 1) c.send(s);
+        if (c.readyState === 1) c.send(JSON.stringify(status));
     }
-}
-
-// Helper: safely start processing a listener's queue
-function processListenerQueue(client) {
-    if (!client || client.readyState !== 1) {
-        listenerProcessing.set(client, false);
-        return;
-    }
-    if (listenerProcessing.get(client)) return; // already processing
-    const q = listenerQueues.get(client);
-    if (!q || q.length === 0) {
-        listenerProcessing.set(client, false);
-        return;
-    }
-
-    listenerProcessing.set(client, true);
-
-    const chunk = q.shift();
-    // Use ws.send callback so we don't push too fast.
-    client.send(chunk, { binary: true }, (err) => {
-        if (err) {
-            console.warn("Failed to send audio chunk to client:", err);
-            // If send fails, we stop processing this client. Client will reconnect or be cleaned up.
-            listenerProcessing.set(client, false);
-            return;
-        }
-        // Slight pause to let TCP flush (helps avoid bursts). Tune if needed.
-        // Use setImmediate so we don't block event loop.
-        setImmediate(() => processListenerQueue(client));
-    });
-}
-
-// When new listener connects, seed its queue with initChunks then start processing
-function enqueueInitChunksFor(client) {
-    if (!initChunks.length) return;
-    const q = listenerQueues.get(client);
-    if (!q) return;
-    // push copies (Buffer)
-    for (const c of initChunks) {
-        q.push(Buffer.from(c));
-    }
-    processListenerQueue(client);
 }
 
 wss.on("connection", (ws, req) => {
+    // get client ip (respect x-forwarded-for)
     const forwarded = req.headers["x-forwarded-for"];
     const ip = forwarded ? forwarded.split(",")[0].trim() : req.socket.remoteAddress;
     const normalIP = (ip || "").replace("::ffff:", "");
 
-    ws.isBroadcaster = normalIP === AUTHORIZED_IP;
-    ws._remoteIP = normalIP;
+    console.log("Connection from", normalIP);
 
-    // Inform this client of its role
-    try {
-        ws.send(JSON.stringify({
-            type: "role",
-            role: ws.isBroadcaster ? "broadcaster" : "listener"
-        }));
-    } catch (e) {
-        // ignore
+    // assign role: broadcaster if IP matches and no broadcaster already
+    ws.isBroadcaster = (normalIP === AUTHORIZED_IP);
+
+    if (ws.isBroadcaster) {
+        broadcaster = ws;
+        console.log("Broadcaster connected:", normalIP);
+        send(ws, { type: "role", role: "broadcaster" });
+    } else {
+        // create an id for watcher
+        const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+        ws._watcherId = id;
+        watchers.set(id, ws);
+        send(ws, { type: "role", role: "listener", id });
+        console.log("Listener connected:", normalIP, "id=", id);
     }
 
-    // Initialize per-listener queue for non-broadcasters
-    if (!ws.isBroadcaster) {
-        listenerQueues.set(ws, []);
-        listenerProcessing.set(ws, false);
-        // Send init chunks immediately so late-joiners can decode
-        enqueueInitChunksFor(ws);
-    }
+    // Immediately announce status
+    broadcastStatus();
 
-    // Broadcast status
-    broadcastJSON({
-        type: "status",
-        broadcasterConnected: Array.from(wss.clients).some(c => c.isBroadcaster),
-        listenerCount: Array.from(wss.clients).filter(c => !c.isBroadcaster).length
-    });
+    ws.on("message", (raw) => {
+        // message may be text JSON
+        // For binary (not used here) we could adapt, but we expect JSON signaling
+        let msg;
+        try { msg = JSON.parse(raw.toString()); } catch (e) { console.warn("Bad JSON", e); return; }
 
-    console.log(`Client connected ${normalIP} role=${ws.isBroadcaster ? "b" : "l"}`);
+        // route messages
+        // expected messages:
+        // { type: "watcher", id: "<watcherId>" }   // (sent by listener?) -> often server->broadcaster triggers
+        // { type: "offer", target: "<id>", sdp: ... }  // sent by broadcaster -> forwarded to the listener id
+        // { type: "answer", target: "<id>", sdp: ... } // sent by listener -> forwarded to broadcaster
+        // { type: "candidate", target: "<id>", candidate: ... }  // either side -> forward
+        // We'll treat 'watcher' as listener requesting to watch; server forwards to broadcaster.
 
-    ws.on("message", (msg, isBinary) => {
-        // Broadcaster sending audio blobs
-        if (ws.isBroadcaster) {
-            if (isBinary) {
-                // Store first few chunks as initChunks if we haven't yet filled
-                try {
-                    const buf = Buffer.from(msg);
-                    if (initChunks.length < INIT_CHUNKS_MAX) {
-                        initChunks.push(Buffer.from(buf));
-                        console.log("Saved init chunk, size:", buf.length, "totalInitChunks:", initChunks.length);
-                    } else {
-                        // rotate: keep last INIT_CHUNKS_MAX chunks
-                        initChunks.shift();
-                        initChunks.push(Buffer.from(buf));
-                    }
-                } catch (e) {
-                    console.warn("Error buffering init chunk:", e);
-                }
-
-                // Relay to listeners by enqueuing into their queues
-                for (const client of wss.clients) {
-                    if (client === ws) continue; // don't send back to broadcaster
-                    if (client.readyState !== 1) continue;
-                    // Only listeners have queues (we created above)
-                    const q = listenerQueues.get(client);
-                    if (!q) continue;
-                    // Safety: limit queue length to avoid memory blowups (drop old frames if full)
-                    const MAX_Q = 100; // ~100 chunks max; tune as needed
-                    if (q.length > MAX_Q) {
-                        q.splice(0, q.length - MAX_Q);
-                    }
-                    q.push(Buffer.from(msg));
-                    // Kick off processing if not already
-                    processListenerQueue(client);
-                }
+        const t = msg.type;
+        if (t === "watcher") {
+            // A listener asks to watch: forward to broadcaster with listener id
+            if (broadcaster && broadcaster.readyState === 1) {
+                send(broadcaster, { type: "watcher", id: msg.id });
             } else {
-                // Non-binary from broadcaster (control / JSON) — ignore or handle if you add commands
+                // No broadcaster online; optional: notify listener
+                send(ws, { type: "no-broadcaster" });
             }
-            return;
+        } else if (t === "offer") {
+            // Broadcaster -> server -> listener
+            const target = msg.target;
+            const dest = watchers.get(target);
+            if (dest && dest.readyState === 1) {
+                send(dest, { type: "offer", sdp: msg.sdp, from: msg.from || null });
+            }
+        } else if (t === "answer") {
+            // Listener -> server -> broadcaster
+            if (broadcaster && broadcaster.readyState === 1) {
+                send(broadcaster, { type: "answer", sdp: msg.sdp, from: msg.from || null, target: msg.target || null });
+            }
+        } else if (t === "candidate") {
+            // candidate: forward to target
+            const target = msg.target;
+            // target can be broadcaster or a watcher id
+            if (target === "broadcaster") {
+                if (broadcaster && broadcaster.readyState === 1) send(broadcaster, { type: "candidate", candidate: msg.candidate, from: msg.from || null });
+            } else {
+                const dest = watchers.get(target);
+                if (dest && dest.readyState === 1) send(dest, { type: "candidate", candidate: msg.candidate, from: msg.from || null });
+            }
+        } else if (t === "leave") {
+            // listener leaves
+            const id = msg.id;
+            const dest = watchers.get(id);
+            if (dest) {
+                try { dest.close(); } catch { }
+                watchers.delete(id);
+            }
+            broadcastStatus();
+        } else {
+            // unknown message
+            // console.log("Unknown message", msg);
         }
-
-        // Non-broadcaster sending — ignore or handle control messages
-        // You could accept control messages (pings) here if needed.
     });
 
     ws.on("close", () => {
-        console.log(`Client disconnected ${ws._remoteIP}`);
-        // Clean up listener maps
-        listenerQueues.delete(ws);
-        listenerProcessing.delete(ws);
-
-        broadcastJSON({
-            type: "status",
-            broadcasterConnected: Array.from(wss.clients).some(c => c.isBroadcaster),
-            listenerCount: Array.from(wss.clients).filter(c => !c.isBroadcaster).length
-        });
+        if (ws.isBroadcaster) {
+            console.log("Broadcaster disconnected");
+            broadcaster = null;
+            // optionally close all watchers? No — keep watchers, they'll receive no offers.
+        } else {
+            // remove watcher
+            const id = ws._watcherId;
+            if (id) {
+                watchers.delete(id);
+                // notify broadcaster so it can cleanup pc if needed
+                if (broadcaster && broadcaster.readyState === 1) {
+                    send(broadcaster, { type: "watcher-left", id });
+                }
+            }
+            console.log("Listener disconnected", ws._remoteIP || ws._watcherId);
+        }
+        broadcastStatus();
     });
 
     ws.on("error", (err) => {
         console.warn("WS error", err);
-        // On error, clean up
-        listenerQueues.delete(ws);
-        listenerProcessing.delete(ws);
     });
 });
 
-// Periodic status update
-setInterval(() => {
-    broadcastJSON({
-        type: "status",
-        broadcasterConnected: Array.from(wss.clients).some(c => c.isBroadcaster),
-        listenerCount: Array.from(wss.clients).filter(c => !c.isBroadcaster).length
-    });
-}, 1500);
-
-// Bind to 0.0.0.0 for Railway
 server.listen(PORT, "0.0.0.0", () => {
-    console.log("Audio relay WebSocket running on port", PORT);
+    console.log("Signaling server listening on port", PORT);
 });
