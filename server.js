@@ -40,6 +40,7 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-server.listen(PORT, () => {
+// IMPORTANT FIX: must bind to 0.0.0.0 for Railway
+server.listen(PORT, "0.0.0.0", () => {
     console.log("WebSocket audio relay running on port:", PORT);
 });
