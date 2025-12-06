@@ -2,10 +2,9 @@
 import http from "http";
 import { WebSocketServer } from "ws";
 
-const AUTHORIZED_IP = "115.129.74.51"; // broadcaster IP
+const AUTHORIZED_IP = "115.129.74.51"; // broadcaster IP (your machine)
 const PORT = process.env.PORT || 3000;
 
-// Simple HTTP health endpoint for Railway
 const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("WebRTC signaling server OK\n");
@@ -13,9 +12,9 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-// Keep track of connections
-let broadcaster = null; // ws of broadcaster
-const watchers = new Map(); // watcherId -> ws
+// bookkeeping
+let broadcaster = null;                // ws of broadcaster (by IP)
+const watchers = new Map();            // watcherId -> ws
 
 function sendJson(ws, obj) {
     if (!ws || ws.readyState !== 1) return;
@@ -41,18 +40,19 @@ wss.on("connection", (ws, req) => {
     ws.remoteIP = normalIP;
     ws.isBroadcaster = (normalIP === AUTHORIZED_IP);
 
+    // Announce role to client; listeners get an id
     if (ws.isBroadcaster) {
         broadcaster = ws;
         sendJson(ws, { type: "role", role: "broadcaster" });
         console.log("Broadcaster connected:", normalIP);
     } else {
-        // create id
         const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
         ws.watcherId = id;
         watchers.set(id, ws);
         sendJson(ws, { type: "role", role: "listener", id });
         console.log("Listener connected:", normalIP, "id:", id);
-        // notify broadcaster (if present)
+
+        // notify broadcaster a watcher wants to connect (so broadcaster can create a pc)
         if (broadcaster && broadcaster.readyState === 1) {
             sendJson(broadcaster, { type: "watcher", id });
         }
@@ -61,7 +61,6 @@ wss.on("connection", (ws, req) => {
     broadcastStatus();
 
     ws.on("message", (raw) => {
-        // Expect JSON text messages for signaling
         let msg;
         try { msg = JSON.parse(raw.toString()); } catch (e) {
             console.warn("Bad JSON from", ws.remoteIP, e);
@@ -70,28 +69,41 @@ wss.on("connection", (ws, req) => {
 
         const t = msg.type;
         if (t === "offer") {
-            // broadcaster -> server -> listener
+            // broadcaster -> server -> specific listener (target)
             const target = msg.target;
             const dest = watchers.get(target);
-            if (dest && dest.readyState === 1) sendJson(dest, { type: "offer", sdp: msg.sdp, from: msg.from || null });
+            if (dest && dest.readyState === 1) {
+                sendJson(dest, { type: "offer", sdp: msg.sdp, from: msg.from || null });
+            } else {
+                console.warn("Offer target not found or closed:", target);
+            }
         } else if (t === "answer") {
-            // listener -> server -> broadcaster
+            // listener -> server -> broadcaster (listener includes from=id)
             if (broadcaster && broadcaster.readyState === 1) {
-                sendJson(broadcaster, { type: "answer", sdp: msg.sdp, from: msg.from || null, target: msg.target || null });
+                sendJson(broadcaster, { type: "answer", sdp: msg.sdp, from: msg.from || null });
+            } else {
+                console.warn("No broadcaster to forward answer to");
             }
         } else if (t === "candidate") {
-            // candidate forward
+            // candidate forwarding: target can be 'broadcaster' or a watcherId
             const target = msg.target;
             if (target === "broadcaster") {
-                if (broadcaster && broadcaster.readyState === 1) sendJson(broadcaster, { type: "candidate", candidate: msg.candidate, from: msg.from || null });
+                if (broadcaster && broadcaster.readyState === 1) {
+                    sendJson(broadcaster, { type: "candidate", candidate: msg.candidate, from: msg.from || null });
+                }
             } else {
                 const dest = watchers.get(target);
-                if (dest && dest.readyState === 1) sendJson(dest, { type: "candidate", candidate: msg.candidate, from: msg.from || null });
+                if (dest && dest.readyState === 1) {
+                    sendJson(dest, { type: "candidate", candidate: msg.candidate, from: msg.from || null });
+                }
             }
         } else if (t === "watcher") {
-            // Allow listener to request watch again; forward to broadcaster if present
-            if (broadcaster && broadcaster.readyState === 1) sendJson(broadcaster, { type: "watcher", id: msg.id });
-            else sendJson(ws, { type: "no-broadcaster" });
+            // listener can request watch again (forward to broadcaster)
+            if (broadcaster && broadcaster.readyState === 1) {
+                sendJson(broadcaster, { type: "watcher", id: msg.id });
+            } else {
+                sendJson(ws, { type: "no-broadcaster" });
+            }
         } else if (t === "leave") {
             const id = msg.id;
             const dest = watchers.get(id);
@@ -101,8 +113,8 @@ wss.on("connection", (ws, req) => {
             }
             broadcastStatus();
         } else {
-            // Unknown message - ignore or log
-            // console.log("unknown msg", msg);
+            // unknown message
+            // console.log("Unknown message type:", t, msg);
         }
     });
 
@@ -110,7 +122,7 @@ wss.on("connection", (ws, req) => {
         if (ws.isBroadcaster) {
             console.log("Broadcaster disconnected");
             broadcaster = null;
-            // optionally notify watchers
+            // optionally inform watchers (they will try to reconnect)
         } else {
             if (ws.watcherId) {
                 watchers.delete(ws.watcherId);
@@ -128,7 +140,6 @@ wss.on("connection", (ws, req) => {
     });
 });
 
-// Auto broadcast status every 1.5s
 setInterval(broadcastStatus, 1500);
 
 server.listen(PORT, "0.0.0.0", () => {
