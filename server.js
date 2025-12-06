@@ -1,12 +1,17 @@
 import { WebSocketServer } from 'ws';
 import http from 'http';
 
-// Your IP address (broadcast only allowed from here)
+// Your IP (only you can broadcast)
 const AUTHORIZED_IP = "115.129.74.51";
 
 const PORT = process.env.PORT || 3000;
 
-const server = http.createServer();
+// IMPORTANT: HTTP response so Railway doesn't freeze
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("WebSocket audio relay server is running.");
+});
+
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
@@ -18,17 +23,16 @@ wss.on('connection', (ws, req) => {
 
     if (!ws.isBroadcaster) {
         ws.send(JSON.stringify({ type: "info", message: "You are a listener only." }));
-        console.log("A listener connected:", clientIP);
+        console.log("Listener connected:", clientIP);
     } else {
         ws.send(JSON.stringify({ type: "authorized", message: "You may broadcast audio." }));
         console.log("Broadcaster connected:", clientIP);
     }
 
     ws.on('message', (msg) => {
-        if (!ws.isBroadcaster) return; // ignore messages from listeners
+        if (!ws.isBroadcaster) return;
 
-        // Relay audio to all listeners
-        wss.clients.forEach((client) => {
+        wss.clients.forEach(client => {
             if (client !== ws && client.readyState === 1) {
                 client.send(msg);
             }
@@ -40,7 +44,7 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// IMPORTANT FIX: must bind to 0.0.0.0 for Railway
+// MUST bind to 0.0.0.0 on Railway
 server.listen(PORT, "0.0.0.0", () => {
     console.log("WebSocket audio relay running on port:", PORT);
 });
