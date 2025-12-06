@@ -1,37 +1,40 @@
-import { WebSocketServer } from 'ws';
-import http from 'http';
+import { WebSocketServer } from "ws";
+import http from "http";
 
-// Your IP (only you can broadcast)
-const AUTHORIZED_IP = "115.129.74.51";
-
+const AUTHORIZED_IP = "115.129.74.51"; // YOU are broadcaster
 const PORT = process.env.PORT || 3000;
 
-// IMPORTANT: HTTP response so Railway doesn't freeze
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("WebSocket audio relay server is running.");
-});
-
+const server = http.createServer();
 const wss = new WebSocketServer({ server });
 
-wss.on('connection', (ws, req) => {
-    const clientIP = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress;
+function broadcastJSON(data) {
+    const str = JSON.stringify(data);
+    wss.clients.forEach(c => c.readyState === 1 && c.send(str));
+}
 
-    console.log("Client connected:", clientIP);
+wss.on("connection", (ws, req) => {
+    const clientIP = req.headers["x-forwarded-for"]?.split(",")[0].trim()
+        || req.socket.remoteAddress;
 
-    ws.isBroadcaster = (clientIP === AUTHORIZED_IP);
+    ws.isBroadcaster = clientIP === AUTHORIZED_IP;
 
-    if (!ws.isBroadcaster) {
-        ws.send(JSON.stringify({ type: "info", message: "You are a listener only." }));
-        console.log("Listener connected:", clientIP);
-    } else {
-        ws.send(JSON.stringify({ type: "authorized", message: "You may broadcast audio." }));
-        console.log("Broadcaster connected:", clientIP);
-    }
+    // Notify client of their role
+    ws.send(JSON.stringify({
+        type: "role",
+        role: ws.isBroadcaster ? "broadcaster" : "listener"
+    }));
 
-    ws.on('message', (msg) => {
+    // Update everyone
+    broadcastJSON({
+        type: "status",
+        broadcasterConnected: [...wss.clients].some(c => c.isBroadcaster),
+        listenerCount: [...wss.clients].filter(c => !c.isBroadcaster).length
+    });
+
+    ws.on("message", msg => {
         if (!ws.isBroadcaster) return;
 
+        // Relay audio to listeners
         wss.clients.forEach(client => {
             if (client !== ws && client.readyState === 1) {
                 client.send(msg);
@@ -39,12 +42,15 @@ wss.on('connection', (ws, req) => {
         });
     });
 
-    ws.on('close', () => {
-        console.log("Client disconnected:", clientIP);
+    ws.on("close", () => {
+        broadcastJSON({
+            type: "status",
+            broadcasterConnected: [...wss.clients].some(c => c.isBroadcaster),
+            listenerCount: [...wss.clients].filter(c => !c.isBroadcaster).length
+        });
     });
 });
 
-// MUST bind to 0.0.0.0 on Railway
-server.listen(PORT, "0.0.0.0", () => {
-    console.log("WebSocket audio relay running on port:", PORT);
+server.listen(PORT, () => {
+    console.log("Audio relay WebSocket running on port", PORT);
 });
