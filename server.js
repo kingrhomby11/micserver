@@ -2,146 +2,97 @@
 import http from "http";
 import { WebSocketServer } from "ws";
 
-const AUTHORIZED_IP = "115.129.74.51"; // broadcaster IP (your machine)
+const AUTHORIZED_IP = "115.129.74.51";
 const PORT = process.env.PORT || 3000;
 
 const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("WebRTC signaling server OK\n");
+    res.end("WebRTC signaling OK\n");
 });
 
 const wss = new WebSocketServer({ server });
 
-// bookkeeping
-let broadcaster = null;                // ws of broadcaster (by IP)
-const watchers = new Map();            // watcherId -> ws
+let broadcaster = null;
+const watchers = new Map();
 
-function sendJson(ws, obj) {
-    if (!ws || ws.readyState !== 1) return;
-    try { ws.send(JSON.stringify(obj)); } catch (e) { console.warn("sendJson fail", e); }
-}
+const send = (ws, obj) => {
+    if (ws && ws.readyState === 1)
+        ws.send(JSON.stringify(obj));
+};
 
 function broadcastStatus() {
-    const status = {
+    const s = {
         type: "status",
         broadcasterConnected: !!broadcaster,
-        listenerCount: Array.from(wss.clients).filter(c => c !== broadcaster && c.readyState === 1).length
+        listenerCount: watchers.size
     };
-    for (const c of wss.clients) {
-        if (c.readyState === 1) sendJson(c, status);
-    }
+    for (const c of wss.clients)
+        if (c.readyState === 1) send(c, s);
 }
 
 wss.on("connection", (ws, req) => {
     const forwarded = req.headers["x-forwarded-for"];
-    const ip = forwarded ? forwarded.split(",")[0].trim() : req.socket.remoteAddress;
-    const normalIP = (ip || "").replace("::ffff:", "");
+    const ip = (forwarded ? forwarded.split(",")[0] : req.socket.remoteAddress)
+        .replace("::ffff:", "");
 
-    ws.remoteIP = normalIP;
-    ws.isBroadcaster = (normalIP === AUTHORIZED_IP);
+    ws.isBroadcaster = (ip === AUTHORIZED_IP);
 
-    // Announce role to client; listeners get an id
     if (ws.isBroadcaster) {
         broadcaster = ws;
-        sendJson(ws, { type: "role", role: "broadcaster" });
-        console.log("Broadcaster connected:", normalIP);
+        send(ws, { type: "role", role: "broadcaster" });
+        console.log("Broadcaster:", ip);
     } else {
-        const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
-        ws.watcherId = id;
+        const id = Date.now() + "-" + Math.random().toString(36).slice(2);
         watchers.set(id, ws);
-        sendJson(ws, { type: "role", role: "listener", id });
-        console.log("Listener connected:", normalIP, "id:", id);
+        ws.watcherId = id;
+        send(ws, { type: "role", role: "listener", id });
 
-        // notify broadcaster a watcher wants to connect (so broadcaster can create a pc)
-        if (broadcaster && broadcaster.readyState === 1) {
-            sendJson(broadcaster, { type: "watcher", id });
-        }
+        if (broadcaster)
+            send(broadcaster, { type: "watcher", id });
     }
 
     broadcastStatus();
 
-    ws.on("message", (raw) => {
+    ws.on("message", raw => {
         let msg;
-        try { msg = JSON.parse(raw.toString()); } catch (e) {
-            console.warn("Bad JSON from", ws.remoteIP, e);
-            return;
+        try { msg = JSON.parse(raw); } catch { return; }
+
+        if (msg.type === "offer") {
+            const dest = watchers.get(msg.target);
+            if (dest) send(dest, { type: "offer", sdp: msg.sdp, from: msg.from });
         }
 
-        const t = msg.type;
-        if (t === "offer") {
-            // broadcaster -> server -> specific listener (target)
-            const target = msg.target;
-            const dest = watchers.get(target);
-            if (dest && dest.readyState === 1) {
-                sendJson(dest, { type: "offer", sdp: msg.sdp, from: msg.from || null });
+        else if (msg.type === "answer") {
+            if (broadcaster)
+                send(broadcaster, { type: "answer", sdp: msg.sdp, from: msg.from });
+        }
+
+        else if (msg.type === "candidate") {
+            if (msg.target === "broadcaster") {
+                if (broadcaster)
+                    send(broadcaster, { type: "candidate", candidate: msg.candidate, from: msg.from });
             } else {
-                console.warn("Offer target not found or closed:", target);
+                const dest = watchers.get(msg.target);
+                if (dest)
+                    send(dest, { type: "candidate", candidate: msg.candidate, from: msg.from });
             }
-        } else if (t === "answer") {
-            // listener -> server -> broadcaster (listener includes from=id)
-            if (broadcaster && broadcaster.readyState === 1) {
-                sendJson(broadcaster, { type: "answer", sdp: msg.sdp, from: msg.from || null });
-            } else {
-                console.warn("No broadcaster to forward answer to");
-            }
-        } else if (t === "candidate") {
-            // candidate forwarding: target can be 'broadcaster' or a watcherId
-            const target = msg.target;
-            if (target === "broadcaster") {
-                if (broadcaster && broadcaster.readyState === 1) {
-                    sendJson(broadcaster, { type: "candidate", candidate: msg.candidate, from: msg.from || null });
-                }
-            } else {
-                const dest = watchers.get(target);
-                if (dest && dest.readyState === 1) {
-                    sendJson(dest, { type: "candidate", candidate: msg.candidate, from: msg.from || null });
-                }
-            }
-        } else if (t === "watcher") {
-            // listener can request watch again (forward to broadcaster)
-            if (broadcaster && broadcaster.readyState === 1) {
-                sendJson(broadcaster, { type: "watcher", id: msg.id });
-            } else {
-                sendJson(ws, { type: "no-broadcaster" });
-            }
-        } else if (t === "leave") {
-            const id = msg.id;
-            const dest = watchers.get(id);
-            if (dest) {
-                try { dest.close(); } catch { }
-                watchers.delete(id);
-            }
-            broadcastStatus();
-        } else {
-            // unknown message
-            // console.log("Unknown message type:", t, msg);
         }
     });
 
     ws.on("close", () => {
         if (ws.isBroadcaster) {
-            console.log("Broadcaster disconnected");
             broadcaster = null;
-            // optionally inform watchers (they will try to reconnect)
         } else {
-            if (ws.watcherId) {
-                watchers.delete(ws.watcherId);
-                if (broadcaster && broadcaster.readyState === 1) {
-                    sendJson(broadcaster, { type: "watcher-left", id: ws.watcherId });
-                }
-            }
-            console.log("Listener disconnected", ws.remoteIP);
+            watchers.delete(ws.watcherId);
+            if (broadcaster)
+                send(broadcaster, { type: "watcher-left", id: ws.watcherId });
         }
         broadcastStatus();
-    });
-
-    ws.on("error", (err) => {
-        console.warn("WS error", err);
     });
 });
 
 setInterval(broadcastStatus, 1500);
 
-server.listen(PORT, "0.0.0.0", () => {
-    console.log("Signaling server listening on port", PORT);
-});
+server.listen(PORT, "0.0.0.0", () =>
+    console.log("Signaling on", PORT)
+);
