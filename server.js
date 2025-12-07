@@ -19,113 +19,96 @@ wss.on("connection", (ws) => {
     ws.id = "ws" + nextId++;
     console.log("Client connected:", ws.id);
 
-    ws.on("message", (msg) => {
-        let data;
-        try { data = JSON.parse(msg); } catch { return; }
+    ws.on("message", (raw) => {
+        let msg;
+        try { msg = JSON.parse(raw); } catch { return; }
 
-        // ----------------------------------------------
-        // Broadcaster registers
-        // ----------------------------------------------
-        if (data.type === "broadcaster") {
+        // broadcaster registers
+        if (msg.type === "broadcaster") {
             broadcaster = ws;
             console.log("Broadcaster ONLINE");
-
-            // Notify listeners that broadcaster is online
-            listeners.forEach(l => {
-                l.send(JSON.stringify({ type: "status", broadcaster: true }));
+            // notify all listeners
+            listeners.forEach((l) => {
+                try { l.send(JSON.stringify({ type: "status", broadcaster: true })); } catch { }
             });
             return;
         }
 
-        // ----------------------------------------------
-        // Listener registers
-        // ----------------------------------------------
-        if (data.type === "listener") {
+        // listener registers
+        if (msg.type === "listener") {
             listeners.set(ws.id, ws);
             console.log("Listener joined:", ws.id);
-
-            // Tell listener if broadcaster exists
-            ws.send(JSON.stringify({
-                type: "status",
-                broadcaster: !!broadcaster
-            }));
-
-            // Tell broadcaster a listener arrived
-            if (broadcaster) {
-                broadcaster.send(JSON.stringify({
-                    type: "listener-join",
-                    id: ws.id
-                }));
+            // tell listener whether broadcaster exists
+            try { ws.send(JSON.stringify({ type: "status", broadcaster: !!broadcaster })); } catch { }
+            // notify broadcaster to create a PC for this listener
+            if (broadcaster && broadcaster.readyState === 1) {
+                try { broadcaster.send(JSON.stringify({ type: "listener-join", id: ws.id })); } catch { }
             }
             return;
         }
 
-        // ----------------------------------------------
-        // Broadcaster sends targeted offer
-        // ----------------------------------------------
-        if (data.type === "offer" && ws === broadcaster) {
-            const l = listeners.get(data.target);
-            if (l) {
-                l.send(JSON.stringify({
-                    type: "offer",
-                    sdp: data.sdp,
-                    from: "broadcaster"
-                }));
+        // broadcaster -> targeted offer
+        if (msg.type === "offer" && ws === broadcaster) {
+            const target = listeners.get(msg.target);
+            if (target && target.readyState === 1) {
+                try {
+                    target.send(JSON.stringify({ type: "offer", sdp: msg.sdp, from: "broadcaster" }));
+                } catch { }
             }
             return;
         }
 
-        // ----------------------------------------------
-        // Listener sends answer back
-        // ----------------------------------------------
-        if (data.type === "answer") {
-            if (broadcaster) {
-                broadcaster.send(JSON.stringify({
-                    type: "answer",
-                    sdp: data.sdp,
-                    from: ws.id
-                }));
+        // listener -> answer back to broadcaster
+        if (msg.type === "answer") {
+            if (broadcaster && broadcaster.readyState === 1) {
+                try {
+                    broadcaster.send(JSON.stringify({ type: "answer", sdp: msg.sdp, from: ws.id }));
+                } catch { }
             }
             return;
         }
 
-        // ----------------------------------------------
-        // ICE candidate forwarding
-        // ----------------------------------------------
-        if (data.type === "candidate") {
-            if (data.target && listeners.has(data.target)) {
-                listeners.get(data.target).send(JSON.stringify({
-                    type: "candidate",
-                    candidate: data.candidate
-                }));
-            } else if (ws !== broadcaster && broadcaster) {
-                broadcaster.send(JSON.stringify({
-                    type: "candidate",
-                    candidate: data.candidate,
-                    from: ws.id
-                }));
+        // ICE forwarding
+        if (msg.type === "candidate") {
+            // if target is a listener id, forward to that listener
+            if (msg.target && listeners.has(msg.target)) {
+                const dest = listeners.get(msg.target);
+                if (dest && dest.readyState === 1) {
+                    try { dest.send(JSON.stringify({ type: "candidate", candidate: msg.candidate })); } catch { }
+                }
+            } else {
+                // otherwise (listener -> broadcaster) forward to broadcaster
+                if (broadcaster && broadcaster.readyState === 1) {
+                    try { broadcaster.send(JSON.stringify({ type: "candidate", candidate: msg.candidate, from: ws.id })); } catch { }
+                }
             }
+            return;
         }
     });
 
-    // ----------------------------------------------
-    // Handle disconnects
-    // ----------------------------------------------
     ws.on("close", () => {
         console.log("Disconnected:", ws.id);
 
         if (ws === broadcaster) {
-            console.log("Broadcaster OFFLINE");
             broadcaster = null;
-            listeners.forEach(l => {
-                l.send(JSON.stringify({ type: "status", broadcaster: false }));
+            console.log("Broadcaster OFFLINE");
+            listeners.forEach((l) => {
+                try { l.send(JSON.stringify({ type: "status", broadcaster: false })); } catch { }
             });
         }
 
         if (listeners.has(ws.id)) {
             listeners.delete(ws.id);
-            console.log("Listener removed:", ws.id);
+            console.log("Listener removed", ws.id);
+            // optionally inform broadcaster that listener left (not required)
+            if (broadcaster && broadcaster.readyState === 1) {
+                try { broadcaster.send(JSON.stringify({ type: "listener-left", id: ws.id })); } catch { }
+            }
         }
+    });
+
+    ws.on("error", (err) => {
+        console.warn("ws error", err);
     });
 });
 
