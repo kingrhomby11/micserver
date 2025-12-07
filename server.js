@@ -1,4 +1,5 @@
-﻿import http from "http";
+﻿// server.js
+import http from "http";
 import { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 3000;
@@ -11,7 +12,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 let broadcaster = null;
-let listeners = new Map(); // id → ws
+let listeners = new Map(); // id -> ws
 let nextId = 1;
 
 wss.on("connection", (ws) => {
@@ -22,23 +23,28 @@ wss.on("connection", (ws) => {
         let data;
         try { data = JSON.parse(msg); } catch { return; }
 
-        // Broadcaster registers itself
+        // ----------------------------------------------
+        // Broadcaster registers
+        // ----------------------------------------------
         if (data.type === "broadcaster") {
             broadcaster = ws;
             console.log("Broadcaster ONLINE");
 
-            // Notify existing listeners
-            listeners.forEach(listener => {
-                listener.send(JSON.stringify({ type: "status", broadcaster: true }));
+            // Notify listeners that broadcaster is online
+            listeners.forEach(l => {
+                l.send(JSON.stringify({ type: "status", broadcaster: true }));
             });
             return;
         }
 
-        // Listener registers itself
+        // ----------------------------------------------
+        // Listener registers
+        // ----------------------------------------------
         if (data.type === "listener") {
             listeners.set(ws.id, ws);
             console.log("Listener joined:", ws.id);
 
+            // Tell listener if broadcaster exists
             ws.send(JSON.stringify({
                 type: "status",
                 broadcaster: !!broadcaster
@@ -46,13 +52,18 @@ wss.on("connection", (ws) => {
 
             // Tell broadcaster a listener arrived
             if (broadcaster) {
-                broadcaster.send(JSON.stringify({ type: "listener-join", id: ws.id }));
+                broadcaster.send(JSON.stringify({
+                    type: "listener-join",
+                    id: ws.id
+                }));
             }
             return;
         }
 
-        // Broadcaster sends offer targeted to listener
-        if (data.type === "offer" && broadcaster === ws) {
+        // ----------------------------------------------
+        // Broadcaster sends targeted offer
+        // ----------------------------------------------
+        if (data.type === "offer" && ws === broadcaster) {
             const l = listeners.get(data.target);
             if (l) {
                 l.send(JSON.stringify({
@@ -64,7 +75,9 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        // Listener sends answer back to broadcaster
+        // ----------------------------------------------
+        // Listener sends answer back
+        // ----------------------------------------------
         if (data.type === "answer") {
             if (broadcaster) {
                 broadcaster.send(JSON.stringify({
@@ -76,7 +89,9 @@ wss.on("connection", (ws) => {
             return;
         }
 
+        // ----------------------------------------------
         // ICE candidate forwarding
+        // ----------------------------------------------
         if (data.type === "candidate") {
             if (data.target && listeners.has(data.target)) {
                 listeners.get(data.target).send(JSON.stringify({
@@ -93,6 +108,9 @@ wss.on("connection", (ws) => {
         }
     });
 
+    // ----------------------------------------------
+    // Handle disconnects
+    // ----------------------------------------------
     ws.on("close", () => {
         console.log("Disconnected:", ws.id);
 
@@ -106,7 +124,7 @@ wss.on("connection", (ws) => {
 
         if (listeners.has(ws.id)) {
             listeners.delete(ws.id);
-            console.log("Listener removed", ws.id);
+            console.log("Listener removed:", ws.id);
         }
     });
 });
