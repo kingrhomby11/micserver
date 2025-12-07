@@ -1,165 +1,116 @@
-﻿// server.js
-import http from "http";
+﻿import http from "http";
 import { WebSocketServer } from "ws";
 
-const AUTHORIZED_IP = "115.129.74.51"; // broadcaster IP (change if needed)
 const PORT = process.env.PORT || 3000;
 
 const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("WebRTC signaling server OK\n");
+    res.end("WebRTC Signaling Server Running\n");
 });
 
 const wss = new WebSocketServer({ server });
 
-// bookkeeping
-let broadcaster = null;            // WebSocket of broadcaster
-const listeners = new Map();       // listenerId -> ws
+let broadcaster = null;
+let listeners = new Map(); // id → ws
+let nextId = 1;
 
-function safeSend(ws, obj) {
-    if (!ws || ws.readyState !== 1) return;
-    try { ws.send(JSON.stringify(obj)); } catch (e) { /* ignore */ }
-}
+wss.on("connection", (ws) => {
+    ws.id = "ws" + nextId++;
+    console.log("Client connected:", ws.id);
 
-function broadcastStatus() {
-    const status = {
-        type: "status",
-        broadcasterConnected: !!broadcaster,
-        listenerCount: listeners.size
-    };
-    for (const c of wss.clients) if (c.readyState === 1) safeSend(c, status);
-}
+    ws.on("message", (msg) => {
+        let data;
+        try { data = JSON.parse(msg); } catch { return; }
 
-wss.on("connection", (ws, req) => {
-    const forwarded = req.headers["x-forwarded-for"];
-    const ip = forwarded ? forwarded.split(",")[0].trim() : req.socket.remoteAddress;
-    const normalIP = (ip || "").replace("::ffff:", "");
-    ws.remoteIP = normalIP;
-    ws.isBroadcaster = (normalIP === AUTHORIZED_IP);
-
-    // announce role to the client if possible
-    if (ws.isBroadcaster) {
-        broadcaster = ws;
-        safeSend(ws, { type: "role", role: "broadcaster" });
-        console.log("Broadcaster connected:", normalIP);
-        // notify any listeners
-        for (const [, l] of listeners) safeSend(l, { type: "status", broadcasterConnected: true });
-    } else {
-        // create listener id and register
-        const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
-        ws.listenerId = id;
-        listeners.set(id, ws);
-        safeSend(ws, { type: "role", role: "listener", id });
-        console.log("Listener connected:", normalIP, "id=", id);
-
-        // notify broadcaster to create a dedicated pc for this listener
-        if (broadcaster && broadcaster.readyState === 1) {
-            safeSend(broadcaster, { type: "watcher", id });
-        } else {
-            // tell listener no broadcaster currently
-            safeSend(ws, { type: "status", broadcasterConnected: false });
-        }
-    }
-
-    broadcastStatus();
-
-    ws.on("message", (raw) => {
-        let msg;
-        try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
-
-        // Allow explicit role claim (client can call this on open)
-        if (msg.type === "broadcaster") {
+        // Broadcaster registers itself
+        if (data.type === "broadcaster") {
             broadcaster = ws;
-            ws.isBroadcaster = true;
-            safeSend(ws, { type: "role", role: "broadcaster" });
-            console.log("Broadcaster declared by client:", ws.remoteIP);
-            // notify watchers
-            for (const [, l] of listeners) safeSend(l, { type: "status", broadcasterConnected: true });
-            broadcastStatus();
+            console.log("Broadcaster ONLINE");
+
+            // Notify existing listeners
+            listeners.forEach(listener => {
+                listener.send(JSON.stringify({ type: "status", broadcaster: true }));
+            });
             return;
         }
 
-        if (msg.type === "listener") {
-            // client asking to be listener (server already created id when connected)
-            safeSend(ws, { type: "role", role: "listener", id: ws.listenerId });
-            return;
-        }
+        // Listener registers itself
+        if (data.type === "listener") {
+            listeners.set(ws.id, ws);
+            console.log("Listener joined:", ws.id);
 
-        // Broadcaster sends an *offer* targeted to a specific listener
-        if (msg.type === "offer" && msg.target) {
-            const target = msg.target;
-            const dest = listeners.get(target);
-            if (dest && dest.readyState === 1) {
-                safeSend(dest, { type: "offer", offer: msg.offer, from: "broadcaster" });
-            } else {
-                console.warn("Offer target not found:", target);
+            ws.send(JSON.stringify({
+                type: "status",
+                broadcaster: !!broadcaster
+            }));
+
+            // Tell broadcaster a listener arrived
+            if (broadcaster) {
+                broadcaster.send(JSON.stringify({ type: "listener-join", id: ws.id }));
             }
             return;
         }
 
-        // Listener sends an *answer* back (msg.from should be listenerId)
-        if (msg.type === "answer" && msg.from) {
-            if (broadcaster && broadcaster.readyState === 1) {
-                safeSend(broadcaster, { type: "answer", answer: msg.answer, from: msg.from });
-            }
-            return;
-        }
-
-        // ICE candidate forwarding. msg.target either 'broadcaster' or a listenerId
-        if (msg.type === "candidate") {
-            const tgt = msg.target;
-            if (tgt === "broadcaster") {
-                if (broadcaster && broadcaster.readyState === 1) {
-                    safeSend(broadcaster, { type: "candidate", candidate: msg.candidate, from: msg.from });
-                }
-            } else {
-                const dest = listeners.get(tgt);
-                if (dest && dest.readyState === 1) {
-                    safeSend(dest, { type: "candidate", candidate: msg.candidate, from: msg.from });
-                }
-            }
-            return;
-        }
-
-        // listener leaving voluntarily
-        if (msg.type === "leave" && msg.id) {
-            const l = listeners.get(msg.id);
+        // Broadcaster sends offer targeted to listener
+        if (data.type === "offer" && broadcaster === ws) {
+            const l = listeners.get(data.target);
             if (l) {
-                try { l.close(); } catch { }
-                listeners.delete(msg.id);
+                l.send(JSON.stringify({
+                    type: "offer",
+                    sdp: data.sdp,
+                    from: "broadcaster"
+                }));
             }
-            broadcastStatus();
             return;
         }
 
-        // ignore unknown messages
+        // Listener sends answer back to broadcaster
+        if (data.type === "answer") {
+            if (broadcaster) {
+                broadcaster.send(JSON.stringify({
+                    type: "answer",
+                    sdp: data.sdp,
+                    from: ws.id
+                }));
+            }
+            return;
+        }
+
+        // ICE candidate forwarding
+        if (data.type === "candidate") {
+            if (data.target && listeners.has(data.target)) {
+                listeners.get(data.target).send(JSON.stringify({
+                    type: "candidate",
+                    candidate: data.candidate
+                }));
+            } else if (ws !== broadcaster && broadcaster) {
+                broadcaster.send(JSON.stringify({
+                    type: "candidate",
+                    candidate: data.candidate,
+                    from: ws.id
+                }));
+            }
+        }
     });
 
     ws.on("close", () => {
-        if (ws.isBroadcaster) {
-            broadcaster = null;
-            console.log("Broadcaster disconnected");
-            // notify listeners
-            for (const [, l] of listeners) safeSend(l, { type: "status", broadcasterConnected: false });
-        } else {
-            if (ws.listenerId) {
-                listeners.delete(ws.listenerId);
-                console.log("Listener disconnected:", ws.listenerId);
-                if (broadcaster && broadcaster.readyState === 1) {
-                    safeSend(broadcaster, { type: "watcher-left", id: ws.listenerId });
-                }
-            }
-        }
-        broadcastStatus();
-    });
+        console.log("Disconnected:", ws.id);
 
-    ws.on("error", (err) => {
-        console.warn("WS error", err);
+        if (ws === broadcaster) {
+            console.log("Broadcaster OFFLINE");
+            broadcaster = null;
+            listeners.forEach(l => {
+                l.send(JSON.stringify({ type: "status", broadcaster: false }));
+            });
+        }
+
+        if (listeners.has(ws.id)) {
+            listeners.delete(ws.id);
+            console.log("Listener removed", ws.id);
+        }
     });
 });
 
-setInterval(broadcastStatus, 1500);
-
-server.listen(PORT, "0.0.0.0", () => {
-    console.log("Signaling server listening on port", PORT);
+server.listen(PORT, () => {
+    console.log("Signaling server running on port", PORT);
 });
