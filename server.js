@@ -1,165 +1,108 @@
-﻿// server.js
-import http from "http";
-import { WebSocketServer } from "ws";
+﻿< !doctype html >
+    <html>
+        <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width,initial-scale=1" />
+            <title>Listener — WebRTC One-Way</title>
+            <style>
+                body{font - family:Arial;background:#111;color:#eee;padding:20px;text-align:center}
+                button{padding:10px 14px;margin:8px;border-radius:6px;border:none;cursor:pointer}
+                audio{width:100%;margin-top:12px}
+            </style>
+        </head>
+        <body>
+            <h2>Listener</h2>
+            <div><strong>Status:</strong> <span id="status">Connecting...</span></div>
+            <div style="margin:12px 0;">
+                <button id="playBtn">Play</button>
+                <button id="muteBtn" disabled>Mute</button>
+            </div>
+            <audio id="player" controls autoplay playsinline></audio>
 
-const AUTHORIZED_IP = "115.129.74.51"; // broadcaster IP (change if needed)
-const PORT = process.env.PORT || 3000;
+            <script>
+(() => {
+  const SIGNALING_WS = "wss://micserver-production.up.railway.app"; // set your signaling server
+                const ICE_CONFIG = {iceServers: [{urls: "stun:stun.l.google.com:19302" }] };
 
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("WebRTC signaling server OK\n");
-});
+                const statusEl = document.getElementById("status");
+                const player = document.getElementById("player");
+                const playBtn = document.getElementById("playBtn");
+                const muteBtn = document.getElementById("muteBtn");
 
-const wss = new WebSocketServer({ server });
+                let ws = new WebSocket(SIGNALING_WS);
+                let pc = null;
+                let listenerId = null;
 
-// bookkeeping
-let broadcaster = null;            // WebSocket of broadcaster
-const listeners = new Map();       // listenerId -> ws
+  ws.onopen = () => {
+                    console.log("WS open");
+                ws.send(JSON.stringify({type: "listener" })); // ask server to register us
+                statusEl.textContent = "Connected to signaling (waiting for offer)";
+  };
 
-function safeSend(ws, obj) {
-    if (!ws || ws.readyState !== 1) return;
-    try { ws.send(JSON.stringify(obj)); } catch (e) { /* ignore */ }
-}
+  ws.onmessage = async (ev) => {
+                    let msg;
+                try {msg = JSON.parse(ev.data); } catch (e) { return; }
+                console.log("WS msg", msg);
 
-function broadcastStatus() {
-    const status = {
-        type: "status",
-        broadcasterConnected: !!broadcaster,
-        listenerCount: listeners.size
-    };
-    for (const c of wss.clients) if (c.readyState === 1) safeSend(c, status);
-}
-
-wss.on("connection", (ws, req) => {
-    const forwarded = req.headers["x-forwarded-for"];
-    const ip = forwarded ? forwarded.split(",")[0].trim() : req.socket.remoteAddress;
-    const normalIP = (ip || "").replace("::ffff:", "");
-    ws.remoteIP = normalIP;
-    ws.isBroadcaster = (normalIP === AUTHORIZED_IP);
-
-    // announce role to the client if possible
-    if (ws.isBroadcaster) {
-        broadcaster = ws;
-        safeSend(ws, { type: "role", role: "broadcaster" });
-        console.log("Broadcaster connected:", normalIP);
-        // notify any listeners
-        for (const [, l] of listeners) safeSend(l, { type: "status", broadcasterConnected: true });
-    } else {
-        // create listener id and register
-        const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
-        ws.listenerId = id;
-        listeners.set(id, ws);
-        safeSend(ws, { type: "role", role: "listener", id });
-        console.log("Listener connected:", normalIP, "id=", id);
-
-        // notify broadcaster to create a dedicated pc for this listener
-        if (broadcaster && broadcaster.readyState === 1) {
-            safeSend(broadcaster, { type: "watcher", id });
-        } else {
-            // tell listener no broadcaster currently
-            safeSend(ws, { type: "status", broadcasterConnected: false });
-        }
+                if (msg.type === "role" && msg.role === "listener" && msg.id) {
+                    listenerId = msg.id;
+                console.log("Assigned listener id:", listenerId);
     }
 
-    broadcastStatus();
+                if (msg.type === "status") {
+                    statusEl.textContent = msg.broadcasterConnected ? "Broadcaster online (waiting offer)" : "No broadcaster";
+                return;
+    }
 
-    ws.on("message", (raw) => {
-        let msg;
-        try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+                if (msg.type === "offer" && msg.offer) {
+                    // create PC and answer
+                    pc = new RTCPeerConnection(ICE_CONFIG);
 
-        // Allow explicit role claim (client can call this on open)
-        if (msg.type === "broadcaster") {
-            broadcaster = ws;
-            ws.isBroadcaster = true;
-            safeSend(ws, { type: "role", role: "broadcaster" });
-            console.log("Broadcaster declared by client:", ws.remoteIP);
-            // notify watchers
-            for (const [, l] of listeners) safeSend(l, { type: "status", broadcasterConnected: true });
-            broadcastStatus();
-            return;
+      pc.ontrack = (e) => {
+                    player.srcObject = e.streams[0];
+                muteBtn.disabled = false;
+                try {player.play().catch(() => { }); } catch (e) { }
+                statusEl.textContent = "Playing";
+      };
+
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+                    ws.send(JSON.stringify({
+                        type: "candidate",
+                        candidate: ev.candidate,
+                        target: "broadcaster",
+                        from: listenerId
+                    }));
         }
+      };
 
-        if (msg.type === "listener") {
-            // client asking to be listener (server already created id when connected)
-            safeSend(ws, { type: "role", role: "listener", id: ws.listenerId });
-            return;
-        }
+                try {
+                    await pc.setRemoteDescription(msg.offer);
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
 
-        // Broadcaster sends an *offer* targeted to a specific listener
-        if (msg.type === "offer" && msg.target) {
-            const target = msg.target;
-            const dest = listeners.get(target);
-            if (dest && dest.readyState === 1) {
-                safeSend(dest, { type: "offer", offer: msg.offer, from: "broadcaster" });
-            } else {
-                console.warn("Offer target not found:", target);
-            }
-            return;
-        }
+                // send answer back (include from=listenerId so server routes it)
+                ws.send(JSON.stringify({type: "answer", answer: pc.localDescription, from: listenerId }));
+      } catch (e) {
+                    console.error("Handle offer failed", e);
+      }
+    }
 
-        // Listener sends an *answer* back (msg.from should be listenerId)
-        if (msg.type === "answer" && msg.from) {
-            if (broadcaster && broadcaster.readyState === 1) {
-                safeSend(broadcaster, { type: "answer", answer: msg.answer, from: msg.from });
-            }
-            return;
-        }
+                if (msg.type === "candidate" && msg.candidate) {
+      if (pc) pc.addIceCandidate(new RTCIceCandidate(msg.candidate)).catch(e => console.warn(e));
+    }
+  };
 
-        // ICE candidate forwarding. msg.target either 'broadcaster' or a listenerId
-        if (msg.type === "candidate") {
-            const tgt = msg.target;
-            if (tgt === "broadcaster") {
-                if (broadcaster && broadcaster.readyState === 1) {
-                    safeSend(broadcaster, { type: "candidate", candidate: msg.candidate, from: msg.from });
-                }
-            } else {
-                const dest = listeners.get(tgt);
-                if (dest && dest.readyState === 1) {
-                    safeSend(dest, { type: "candidate", candidate: msg.candidate, from: msg.from });
-                }
-            }
-            return;
-        }
+  ws.onclose = () => {
+                    statusEl.textContent = "Signaling disconnected";
+  };
 
-        // listener leaving voluntarily
-        if (msg.type === "leave" && msg.id) {
-            const l = listeners.get(msg.id);
-            if (l) {
-                try { l.close(); } catch { }
-                listeners.delete(msg.id);
-            }
-            broadcastStatus();
-            return;
-        }
-
-        // ignore unknown messages
-    });
-
-    ws.on("close", () => {
-        if (ws.isBroadcaster) {
-            broadcaster = null;
-            console.log("Broadcaster disconnected");
-            // notify listeners
-            for (const [, l] of listeners) safeSend(l, { type: "status", broadcasterConnected: false });
-        } else {
-            if (ws.listenerId) {
-                listeners.delete(ws.listenerId);
-                console.log("Listener disconnected:", ws.listenerId);
-                if (broadcaster && broadcaster.readyState === 1) {
-                    safeSend(broadcaster, { type: "watcher-left", id: ws.listenerId });
-                }
-            }
-        }
-        broadcastStatus();
-    });
-
-    ws.on("error", (err) => {
-        console.warn("WS error", err);
-    });
-});
-
-setInterval(broadcastStatus, 1500);
-
-server.listen(PORT, "0.0.0.0", () => {
-    console.log("Signaling server listening on port", PORT);
-});
+  playBtn.onclick = () => player.play().catch(e => console.warn("Play blocked", e));
+  muteBtn.onclick = () => {
+                    player.muted = !player.muted;
+                muteBtn.textContent = player.muted ? "Unmute" : "Mute";
+  };
+})();
+            </script>
+        </body>
+    </html>
