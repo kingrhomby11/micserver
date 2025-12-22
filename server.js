@@ -1,18 +1,20 @@
-﻿// ES Module imports (not require)
+﻿// server.js
 import http from "http";
-import WebSocket, { WebSocketServer } from "ws";
+import { WebSocketServer } from "ws";
 
-// Railway uses dynamic port
 const PORT = process.env.PORT || 3000;
 
-// Create HTTP server (needed for ws upgrade)
 const server = http.createServer();
-
-// WebSocket server attached to HTTP server
 const wss = new WebSocketServer({ server });
 
 let broadcaster = null;
-let listener = null;
+const listeners = new Set();
+
+function send(ws, obj) {
+    if (ws && ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify(obj));
+    }
+}
 
 wss.on("connection", (ws) => {
 
@@ -20,58 +22,67 @@ wss.on("connection", (ws) => {
         let msg;
         try {
             msg = JSON.parse(raw);
-        } catch (err) {
-            console.log("Bad JSON:", raw.toString());
+        } catch {
             return;
         }
 
+        // role registration
         if (msg.type === "broadcaster") {
             broadcaster = ws;
-            console.log("Broadcaster connected");
-            if (listener) listener.send(JSON.stringify({ type: "status", broadcaster: true }));
+            console.log("🎙 Broadcaster connected");
+            listeners.forEach(l =>
+                send(l, { type: "status", broadcaster: true })
+            );
+            return;
         }
 
         if (msg.type === "listener") {
-            listener = ws;
-            console.log("Listener connected");
-            if (broadcaster) listener.send(JSON.stringify({ type: "status", broadcaster: true }));
+            listeners.add(ws);
+            console.log("🔊 Listener connected (", listeners.size, ")");
+            send(ws, { type: "status", broadcaster: !!broadcaster });
+            return;
         }
 
-        if (msg.type === "offer" && listener) {
-            console.log("Forwarding offer to listener");
-            listener.send(JSON.stringify({ type: "offer", sdp: msg.sdp }));
+        // signaling
+        if (msg.type === "offer" && ws === broadcaster) {
+            listeners.forEach(l =>
+                send(l, { type: "offer", sdp: msg.sdp })
+            );
+            return;
         }
 
         if (msg.type === "answer" && broadcaster) {
-            console.log("Forwarding answer to broadcaster");
-            broadcaster.send(JSON.stringify({ type: "answer", sdp: msg.sdp }));
+            send(broadcaster, { type: "answer", sdp: msg.sdp });
+            return;
         }
 
         if (msg.type === "candidate") {
-            console.log("Forwarding ICE candidate");
-
-            if (ws === broadcaster && listener)
-                listener.send(JSON.stringify({ type: "candidate", candidate: msg.candidate }));
-
-            if (ws === listener && broadcaster)
-                broadcaster.send(JSON.stringify({ type: "candidate", candidate: msg.candidate }));
+            if (ws === broadcaster) {
+                listeners.forEach(l =>
+                    send(l, { type: "candidate", candidate: msg.candidate })
+                );
+            } else if (broadcaster) {
+                send(broadcaster, { type: "candidate", candidate: msg.candidate });
+            }
         }
     });
 
     ws.on("close", () => {
         if (ws === broadcaster) {
             broadcaster = null;
-            console.log("Broadcaster disconnected");
-            if (listener) listener.send(JSON.stringify({ type: "status", broadcaster: false }));
+            console.log("🎙 Broadcaster disconnected");
+            listeners.forEach(l =>
+                send(l, { type: "status", broadcaster: false })
+            );
         }
-        if (ws === listener) {
-            listener = null;
-            console.log("Listener disconnected");
+
+        if (listeners.has(ws)) {
+            listeners.delete(ws);
+            console.log("🔊 Listener disconnected (", listeners.size, ")");
         }
     });
 });
 
-// Start server
 server.listen(PORT, () => {
-    console.log("Server running on port", PORT);
+    console.log("🚀 Signaling server running on port", PORT);
 });
