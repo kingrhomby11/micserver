@@ -3,7 +3,9 @@ import http from "http";
 import { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 3000;
-const BROADCASTER_IP = "115.129.74.51"; // only allow this IP for broadcaster
+
+// Only allow this IP to broadcast
+const BROADCASTER_IP = "115.129.74.51";
 
 const server = http.createServer();
 const wss = new WebSocketServer({ server });
@@ -11,6 +13,7 @@ const wss = new WebSocketServer({ server });
 let broadcaster = null;
 const listeners = new Set();
 
+// Helper to send JSON
 function send(ws, obj) {
     if (ws && ws.readyState === ws.OPEN) {
         ws.send(JSON.stringify(obj));
@@ -18,50 +21,43 @@ function send(ws, obj) {
 }
 
 wss.on("connection", (ws, req) => {
-    // Get the client IP
-    let ip = req.socket.remoteAddress;
-    if (ip.startsWith("::ffff:")) ip = ip.replace("::ffff:", ""); // IPv4 fix
-
-    ws.ip = ip; // store IP for reference
-
-    console.log(`✅ Connection attempt from ${ip}`);
+    // Normalize IP to IPv4
+    let ip = req.socket.remoteAddress || "";
+    if (ip.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
+    console.log("New connection from:", ip);
 
     ws.on("message", (raw) => {
         let msg;
         try { msg = JSON.parse(raw); } catch { return; }
 
-        // --- Role registration ---
+        // Broadcaster registration
         if (msg.type === "broadcaster") {
             if (ip !== BROADCASTER_IP) {
-                console.log(`❌ Broadcaster rejected from ${ip}`);
                 ws.close(1008, "Unauthorized IP");
+                console.log("Rejected broadcaster from IP:", ip);
                 return;
             }
-
             broadcaster = ws;
-            console.log("🎙 Broadcaster connected");
-
-            // Notify all listeners
+            console.log("🎙 Broadcaster connected:", ip);
             listeners.forEach(l => send(l, { type: "status", broadcaster: true }));
             return;
         }
 
+        // Listener registration
         if (msg.type === "listener") {
             listeners.add(ws);
-            console.log(`🔊 Listener connected (${listeners.size})`);
+            console.log("🔊 Listener connected (", listeners.size, ") from IP:", ip);
             send(ws, { type: "status", broadcaster: !!broadcaster });
             return;
         }
 
-        // --- Signaling ---
+        // Signaling messages
         if (msg.type === "offer" && ws === broadcaster) {
-            // forward offer to all listeners
             listeners.forEach(l => send(l, { type: "offer", sdp: msg.sdp }));
             return;
         }
 
         if (msg.type === "answer" && broadcaster) {
-            // forward answer from listener to broadcaster
             send(broadcaster, { type: "answer", sdp: msg.sdp });
             return;
         }
@@ -75,17 +71,21 @@ wss.on("connection", (ws, req) => {
         }
     });
 
-    ws.on("close", () => {
+    ws.on("close", (code, reason) => {
         if (ws === broadcaster) {
             broadcaster = null;
             console.log("🎙 Broadcaster disconnected");
             listeners.forEach(l => send(l, { type: "status", broadcaster: false }));
         }
-
         if (listeners.has(ws)) {
             listeners.delete(ws);
-            console.log(`🔊 Listener disconnected (${listeners.size})`);
+            console.log("🔊 Listener disconnected (", listeners.size, ")");
         }
+        console.log(`Connection from ${ip} closed. Code: ${code}, Reason: ${reason.toString()}`);
+    });
+
+    ws.on("error", (err) => {
+        console.error("WebSocket error from", ip, err);
     });
 });
 
