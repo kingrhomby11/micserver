@@ -2,10 +2,11 @@
 import http from "http";
 import { WebSocketServer } from "ws";
 
+// Port
 const PORT = process.env.PORT || 3000;
 
-// Only allow this IP to broadcast
-const BROADCASTER_IP = "115.129.74.51";
+// Secret token for broadcaster (set your own token here or via env variable)
+const BROADCASTER_TOKEN = process.env.BROADCASTER_TOKEN || "MY_SECRET_TOKEN";
 
 const server = http.createServer();
 const wss = new WebSocketServer({ server });
@@ -13,7 +14,7 @@ const wss = new WebSocketServer({ server });
 let broadcaster = null;
 const listeners = new Set();
 
-// Helper to send JSON
+// Helper to send JSON safely
 function send(ws, obj) {
     if (ws && ws.readyState === ws.OPEN) {
         ws.send(JSON.stringify(obj));
@@ -21,22 +22,21 @@ function send(ws, obj) {
 }
 
 wss.on("connection", (ws, req) => {
-    // Normalize IP to IPv4
-    let ip = req.socket.remoteAddress || "";
-    if (ip.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
+    const ip = req.socket.remoteAddress || "";
     console.log("New connection from:", ip);
 
     ws.on("message", (raw) => {
         let msg;
         try { msg = JSON.parse(raw); } catch { return; }
 
-        // Broadcaster registration
+        // Broadcaster registration with token
         if (msg.type === "broadcaster") {
-            if (ip !== BROADCASTER_IP) {
-                ws.close(1008, "Unauthorized IP");
-                console.log("Rejected broadcaster from IP:", ip);
+            if (msg.token !== BROADCASTER_TOKEN) {
+                ws.close(1008, "Unauthorized token");
+                console.log("Rejected broadcaster from", ip, "Invalid token");
                 return;
             }
+
             broadcaster = ws;
             console.log("🎙 Broadcaster connected:", ip);
             listeners.forEach(l => send(l, { type: "status", broadcaster: true }));
