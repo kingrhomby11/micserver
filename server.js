@@ -3,6 +3,7 @@ import http from "http";
 import { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 3000;
+const ALLOWED_IP = "115.129.74.51"; // only allow this IP
 
 const server = http.createServer();
 const wss = new WebSocketServer({ server });
@@ -16,7 +17,23 @@ function send(ws, obj) {
     }
 }
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+    // Get the client IP
+    let ip = req.socket.remoteAddress;
+
+    // Fix IPv4-mapped IPv6 addresses
+    if (ip.startsWith("::ffff:")) {
+        ip = ip.replace("::ffff:", "");
+    }
+
+    // Check IP restriction
+    if (ip !== ALLOWED_IP) {
+        console.log(`❌ Connection rejected from ${ip}`);
+        ws.close(1008, "Unauthorized IP"); // 1008 = policy violation
+        return;
+    }
+
+    console.log(`✅ Connection accepted from ${ip}`);
 
     ws.on("message", (raw) => {
         let msg;
