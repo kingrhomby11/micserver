@@ -1,57 +1,47 @@
 ﻿// server.js
-import http from "http";
 import { WebSocketServer } from "ws";
+import http from "http";
 
-// Port
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000; // Railway sets PORT automatically
 
-// Secret token for broadcaster (set your own token here or via env variable)
-const BROADCASTER_TOKEN = process.env.BROADCASTER_TOKEN || "MY_SECRET_TOKEN";
+// Create HTTP server (required by Railway)
+const server = http.createServer((req, res) => {
+    res.writeHead(200);
+    res.end("Mic WebRTC Signaling Server");
+});
 
-const server = http.createServer();
 const wss = new WebSocketServer({ server });
 
 let broadcaster = null;
 const listeners = new Set();
 
-// Helper to send JSON safely
 function send(ws, obj) {
     if (ws && ws.readyState === ws.OPEN) {
         ws.send(JSON.stringify(obj));
     }
 }
 
-wss.on("connection", (ws, req) => {
-    const ip = req.socket.remoteAddress || "";
-    console.log("New connection from:", ip);
-
+wss.on("connection", (ws) => {
     ws.on("message", (raw) => {
         let msg;
         try { msg = JSON.parse(raw); } catch { return; }
 
-        // Broadcaster registration with token
+        // Register roles
         if (msg.type === "broadcaster") {
-            if (msg.token !== BROADCASTER_TOKEN) {
-                ws.close(1008, "Unauthorized token");
-                console.log("Rejected broadcaster from", ip, "Invalid token");
-                return;
-            }
-
             broadcaster = ws;
-            console.log("🎙 Broadcaster connected:", ip);
+            console.log("🎙 Broadcaster connected");
             listeners.forEach(l => send(l, { type: "status", broadcaster: true }));
             return;
         }
 
-        // Listener registration
         if (msg.type === "listener") {
             listeners.add(ws);
-            console.log("🔊 Listener connected (", listeners.size, ") from IP:", ip);
+            console.log("🔊 Listener connected (", listeners.size, ")");
             send(ws, { type: "status", broadcaster: !!broadcaster });
             return;
         }
 
-        // Signaling messages
+        // Signaling
         if (msg.type === "offer" && ws === broadcaster) {
             listeners.forEach(l => send(l, { type: "offer", sdp: msg.sdp }));
             return;
@@ -71,24 +61,21 @@ wss.on("connection", (ws, req) => {
         }
     });
 
-    ws.on("close", (code, reason) => {
+    ws.on("close", () => {
         if (ws === broadcaster) {
             broadcaster = null;
             console.log("🎙 Broadcaster disconnected");
             listeners.forEach(l => send(l, { type: "status", broadcaster: false }));
         }
+
         if (listeners.has(ws)) {
             listeners.delete(ws);
             console.log("🔊 Listener disconnected (", listeners.size, ")");
         }
-        console.log(`Connection from ${ip} closed. Code: ${code}, Reason: ${reason.toString()}`);
-    });
-
-    ws.on("error", (err) => {
-        console.error("WebSocket error from", ip, err);
     });
 });
 
+// Railway automatically handles HTTPS/WSS
 server.listen(PORT, () => {
     console.log("🚀 Signaling server running on port", PORT);
 });
